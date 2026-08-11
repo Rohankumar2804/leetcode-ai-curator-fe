@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { triggerDeepSync, getJobStatus } from './api';
 import LoadingSpinner from '../components/Auth/LoadingSpinner';
 
@@ -30,6 +30,8 @@ const SyncProgressCard = () => {
   const [jobStatus, setJobStatus] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const pollTimeoutId = useRef(null);
+  const attempts = useRef(0);
 
   // Effect to fetch initial job status if jobId exists on mount
   useEffect(() => {
@@ -54,24 +56,48 @@ const SyncProgressCard = () => {
   }, []); // Run only once on mount
 
   useEffect(() => {
-    let interval;
-    if (jobId && jobStatus?.status !== 'completed' && jobStatus?.status !== 'failed') {
-      interval = setInterval(async () => {
-        try {
-          const response = await getJobStatus(jobId);
-          setJobStatus(response.data);
-          if (response.data.status === 'completed' || response.data.status === 'failed') {
-            setJobId(null); // Stop polling
-          }
-        } catch (err) {
-          console.error('Failed to get job status:', err);
-          setError('Could not fetch sync status.');
-          clearInterval(interval);
+    const maxAttempts = 30;
+    const baseDelay = 3000; // 3 seconds
+    const maxDelay = 30000; // 30 seconds
+
+    const poll = async () => {
+      try {
+        const response = await getJobStatus(jobId);
+        setJobStatus(response.data);
+
+        if (response.data.status === 'completed' || response.data.status === 'failed') {
+          setJobId(null); // Stop polling
+          localStorage.removeItem('syncJobId');
+        } else if (attempts.current < maxAttempts) {
+          attempts.current++;
+          const delay = Math.min(baseDelay * Math.pow(2, attempts.current), maxDelay);
+          pollTimeoutId.current = setTimeout(poll, delay);
+        } else {
+          setError('Sync process timed out. Please try again.');
+          setJobId(null);
+          localStorage.removeItem('syncJobId');
         }
-      }, 3000);
+      } catch (err) {
+        // If getJobStatus fails (e.g. 404), stop polling.
+        console.error('Failed to get job status:', err);
+        setError('Could not fetch sync status. The job may have expired.');
+        setJobId(null); // Stop polling
+        localStorage.removeItem('syncJobId');
+      }
+    };
+
+    if (jobId) {
+      // Start polling immediately, then use exponential backoff.
+      attempts.current = 0;
+      poll();
     }
-    return () => clearInterval(interval);
-  }, [jobId, jobStatus]);
+
+    return () => {
+      if (pollTimeoutId.current) {
+        clearTimeout(pollTimeoutId.current);
+      }
+    };
+  }, [jobId]);
 
   const handleSync = async () => {
     setIsLoading(true);

@@ -167,7 +167,7 @@ export default function AIRecommendations() {
   // Effect to manage polling for recommendation jobs
   useEffect(() => {
     let timeoutId;
-    const maxAttempts = 10;
+    const maxAttempts = 15;
     const baseDelay = 2000;
     const maxDelay = 30000;
 
