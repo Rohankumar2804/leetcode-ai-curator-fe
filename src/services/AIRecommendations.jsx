@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { triggerRecommendations, fetchRecommendations, getRecommendationJobStatus } from './api'; // Import API functions
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { triggerRecommendations, fetchRecommendations, getRecommendationJobStatus, getCurrentUser } from './api'; // Import API functions
+import { useJobPolling } from './useJobPolling.js';
 
 // Helper to safely format API and validation errors
 const formatError = (err, fallback = 'An unexpected error occurred.') => {
@@ -75,13 +76,49 @@ const DEFAULT_STATS = {
 export default function AIRecommendations() {
   const [recommendations, setRecommendations] = useState(INITIAL_RECOMMENDATIONS);
   const [stats, setStats] = useState(DEFAULT_STATS);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [statusMessage, setStatusMessage] = useState("");
+  const [currentUser, setCurrentUser] = useState(null);
   const [error, setError] = useState("");
-  const [recommendationJobId, setRecommendationJobId] = useState(() => localStorage.getItem('recommendationJobId') || null);
-  const [jobJustCompleted, setJobJustCompleted] = useState(false); // Track if a job just finished
-  const [attempts, setAttempts] = useState(() => parseInt(localStorage.getItem('recommendationAttempts') || '0', 10));
 
+  console.log("AIRecommendations component is rendering or re-rendering.");
+
+  // Fetch the current user to create a user-specific storage key.
+  useEffect(() => {
+    const fetchUser = async () => {
+      try {
+        const response = await getCurrentUser();
+        setCurrentUser(response.data);
+      } catch (err) {
+        console.error("Failed to fetch current user:", err);
+        setError(formatError(err, "You must be logged in to view recommendations."));
+      }
+    };
+    fetchUser();
+  }, []);
+
+  const userSpecificJobIdKey = currentUser ? `recommendationJobId_${currentUser.id}` : null;
+
+  const {
+    jobId: recommendationJobId,
+    setJobId: setRecommendationJobId,
+    isPolling,
+    statusMessage,
+  } = useJobPolling(userSpecificJobIdKey ? localStorage.getItem(userSpecificJobIdKey) : null, getRecommendationJobStatus, {
+      storageKey: userSpecificJobIdKey,
+      jobName: 'Recommendations', // Add a name for clearer logging
+      onSuccess: (jobData) => {
+        const resultData = jobData.result || jobData;
+        setRecommendations(formatRecommendations(resultData.recommendations));
+        setStats(formatStats(resultData));
+        setError(""); // Clear previous errors on success
+      },
+      onError: (errorMessage) => {
+        setError(errorMessage);
+      },
+      formatError: formatError,
+    });
+
+  // Ref to ensure initial trigger only happens once
+  const initialTriggerRef = useRef(false);
   // Helper to map and format recommendation fields from backend variations
   const formatRecommendations = (recs) => {
     return (recs || []).map((rec, index) => ({
@@ -144,127 +181,42 @@ export default function AIRecommendations() {
       keyDifference: res.key_difference_or_lesson || res.key_difference || res.keyDifference || "No details provided."
     };
   };
-  // Function to fetch existing recommendations (if no job is active)
-  const fetchExistingRecommendations = useCallback(async () => {
-    // Optimization: If there are no stats and no job, don't make the initial call
-    // that we expect to 404. The user needs to trigger a refresh first.
-    if (stats.totalSolvedAnalyzed === 0 && !recommendationJobId) {
-      console.log("Skipping initial recommendation fetch as no data has been analyzed yet.");
-      return;
-    }
 
-    try {
-      const response = await fetchRecommendations();
-      const resultData = response.data.result || response.data;
-      setRecommendations(formatRecommendations(resultData.recommendations));
-      setStats(formatStats(resultData));
-    } catch (err) {
-      console.error("Failed to fetch existing recommendations:", err);
-      setError(formatError(err, "Failed to load existing recommendations."));
-    }
-  }, [stats.totalSolvedAnalyzed, recommendationJobId]);
-
-  // Effect to manage polling for recommendation jobs
+  // Effect to trigger initial recommendations if no job is running
   useEffect(() => {
-    let timeoutId;
-    const maxAttempts = 15;
-    const baseDelay = 2000;
-    const maxDelay = 30000;
-
-    const pollJobStatus = async (jobIdToPoll) => {
-      const currentAttempt = parseInt(localStorage.getItem('recommendationAttempts') || '0', 10) + 1;
-      setAttempts(prev => prev + 1);
-      localStorage.setItem('recommendationAttempts', String(currentAttempt));
-
-      const currentDelay = Math.min(baseDelay * Math.pow(2, currentAttempt - 1), maxDelay);
-      setStatusMessage(`Generating personalized recommendations... (Attempt ${currentAttempt}/${maxAttempts}. Re-checking in ${currentDelay / 1000}s)`);
-
-      if (currentAttempt > maxAttempts) {
-        setError("Polling timed out. Recommendation generation took too long.");
-        setIsRefreshing(false);
-        setStatusMessage("");
-        setRecommendationJobId(null);
-        localStorage.removeItem('recommendationJobId');
-        localStorage.removeItem('recommendationAttempts');
-        return;
-      }
-
-      try {
-        const statusResponse = await getRecommendationJobStatus(jobIdToPoll);
-        const jobData = statusResponse.data;
-
-        if (jobData.status === "completed") {
-
-          // On completion, fetch the final results to ensure data is fresh
-          // Assuming jobData itself contains the recommendations and stats upon completion
-          const resultData = jobData.result || jobData;
-          setRecommendations(formatRecommendations(resultData.recommendations));
-          setStats(formatStats(resultData));
-          
-          setIsRefreshing(false);
-          setStatusMessage("");
-          setRecommendationJobId(null);
-          localStorage.removeItem('recommendationJobId');
-          localStorage.removeItem('recommendationAttempts');
-          setJobJustCompleted(true); // Flag that we just finished a job
-        } else if (jobData.status === "failed") {
-          throw new Error(jobData.error_message || "AI Recommendation generation job failed on the server.");
-        } else {
-          console.log(`Job status: ${jobData.status}. Retrying in ${currentDelay / 1000} seconds.`);
-          // Schedule the next poll with the calculated backoff delay
-          timeoutId = setTimeout(() => pollJobStatus(jobIdToPoll), currentDelay);
-        }
-      } catch (fetchError) {
-        console.warn("Polling status update check failed:", fetchError);
-        setError(formatError(fetchError, "Failed to get recommendation status."));
-        setIsRefreshing(false);
-        setStatusMessage("");
-        setRecommendationJobId(null);
-        localStorage.removeItem('recommendationJobId');
-        localStorage.removeItem('recommendationAttempts');
-        setJobJustCompleted(true); // Also flag on failure to prevent restart loop
-      }
-    };
-
-    if (recommendationJobId) {
-      setIsRefreshing(true);
-      setStatusMessage("Resuming AI recommendation generation...");
-      
-      // Start the polling process
-      pollJobStatus(recommendationJobId);
-    } else {
-      // If no job ID is found on mount, and a job wasn't just completed,
-      // automatically trigger a new recommendation generation.
-      if (!jobJustCompleted) {
+    console.log("MOUNT EFFECT: Running effect to trigger initial recommendations.");
+    // This ref pattern ensures the effect runs only once on mount, even in Strict Mode
+    if (initialTriggerRef.current === false && userSpecificJobIdKey) {
+      initialTriggerRef.current = true;
+      // If there's no job ID in storage, trigger a new one.
+      if (!recommendationJobId) {
+        console.log(`MOUNT EFFECT: No recommendationJobId found for key ${userSpecificJobIdKey}. Calling handleRefresh().`);
         handleRefresh();
+      } else {
+        // If a job ID exists, the useJobPolling hook will automatically start polling.
+        console.log(`MOUNT EFFECT: Found existing job ID: ${recommendationJobId}. Polling will resume via useJobPolling.`);
       }
     }
 
     return () => {
-      // Cleanup timeout on unmount
-      clearTimeout(timeoutId);
+      console.log("CLEANUP: Running cleanup for mount effect.");
     };
-  }, [recommendationJobId]); // Rerun when jobId changes
-  
+  }, [recommendationJobId, userSpecificJobIdKey]); // Rerunning on jobId change is safe and handles refresh correctly.
+
   const handleRefresh = async () => {
-    setIsRefreshing(true);
+    console.log("handleRefresh called. Triggering new recommendations API.");
+    if (!currentUser) {
+      setError("Cannot refresh recommendations without a logged-in user.");
+      return;
+    }
     setError("");
-    setStatusMessage("Triggering AI recommendation generation...");
-    setAttempts(0); // Reset attempts for a new job
-    localStorage.removeItem('recommendationAttempts');
     try {
-      setJobJustCompleted(false); // Reset the flag when starting a new job
       const triggerResponse = await triggerRecommendations();
       const newJobId = triggerResponse.data.job_id;
-      setRecommendationJobId(newJobId); // This will trigger the useEffect to start polling
-      localStorage.setItem('recommendationJobId', newJobId); // Persist jobId
-      localStorage.setItem('recommendationAttempts', '0');
+      setRecommendationJobId(newJobId);
     } catch (err) {
       console.error("Failed to trigger recommendations:", err);
       setError(formatError(err, "Failed to trigger recommendation generation."));
-      setIsRefreshing(false);
-      setStatusMessage("");
-      localStorage.removeItem('recommendationJobId'); // Clear on error
     }
   };
 
@@ -298,18 +250,18 @@ export default function AIRecommendations() {
         <button
           type="button"
           onClick={handleRefresh}
-          disabled={isRefreshing}
+          disabled={isPolling}
           className="inline-flex items-center gap-x-2 rounded-xl bg-white dark:bg-slate-900 px-4 py-2.5 text-sm font-semibold text-slate-700 dark:text-slate-200 shadow-sm ring-1 ring-inset ring-slate-300 dark:ring-slate-850 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition"
         >
-          <svg className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" strokeWidth="2" stroke="currentColor">
+          <svg className={`h-4 w-4 ${isPolling ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" strokeWidth="2" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
           </svg>
-          <span>{isRefreshing ? "Synthesizing..." : "Refresh Recommendations"}</span>
+          <span>{isPolling ? "Synthesizing..." : "Refresh Recommendations"}</span>
         </button>
       </div>
 
       {/* STATUS & ERROR ALERTS */}
-      {isRefreshing && (
+      {isPolling && (
         <div className="bg-indigo-50 dark:bg-indigo-950/20 border border-indigo-200 dark:border-indigo-900/30 rounded-2xl p-4 flex items-center space-x-3 text-indigo-700 dark:text-indigo-400 animate-pulse">
           <svg className="animate-spin h-5 w-5 text-indigo-600 shrink-0" fill="none" viewBox="0 0 24 24">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />

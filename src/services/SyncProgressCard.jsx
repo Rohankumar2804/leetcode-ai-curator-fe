@@ -55,6 +55,24 @@ const SyncProgressCard = () => {
     fetchInitialJobStatus();
   }, []); // Run only once on mount
 
+  // Effect to handle tab visibility changes
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === 'visible' && jobId) {
+        try {
+          const response = await getJobStatus(jobId);
+          setJobStatus(response.data);
+        } catch (err) {
+          console.error('Failed to fetch job status on visibility change:', err);
+          setError('Could not refresh sync status.');
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [jobId]);
+
   useEffect(() => {
     const maxAttempts = 30;
     const baseDelay = 3000; // 3 seconds

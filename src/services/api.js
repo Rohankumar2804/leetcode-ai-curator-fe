@@ -24,6 +24,24 @@ api.interceptors.request.use(
   }
 );
 
+// Interceptor to handle 401 Unauthorized responses
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const { config, response } = error;
+    // We only want to handle 401s for routes that are not the login route.
+    // A 401 on the login route simply means "invalid credentials".
+    // A 401 on any other route means the JWT is invalid or expired.
+    if (response && response.status === 401 && config.url !== '/login') {
+      localStorage.removeItem('jwtToken');
+      localStorage.setItem('authError', 'Your session has expired. Please log in again.');
+      // Redirect to the main authentication page
+      window.location.href = '/auth';
+    }
+    return Promise.reject(error);
+  }
+);
+
 // API functions
 export const evaluateProblem = (platform, problemId) => api.post(`/api/v1/evaluations/${platform}/${problemId}/evaluate`, {});
 export const triggerDeepSync = (platform) => api.post('/api/v1/users/sync', { provider_name: platform });

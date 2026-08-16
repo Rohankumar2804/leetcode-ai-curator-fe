@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { evaluateProblem, getEvaluationJobStatus } from './api';
+import { useJobPolling } from './useJobPolling.js';
 
 // Helper to safely format API and validation errors
 const formatError = (err, fallback = 'An unexpected error occurred.') => {
@@ -55,22 +56,50 @@ const LOADING_STATUSES = [
 export default function AIEvaluator() {
   const [problemSlug, setProblemSlug] = useState("");
   const [platform, setPlatform] = useState("leetcode");
-  const [isLoading, setIsLoading] = useState(false);
   const [loadingText, setLoadingText] = useState(LOADING_STATUSES[0]);
   const [evaluationResult, setEvaluationResult] = useState(null);
   const [error, setError] = useState("");
 
-  // Smart loading animation text cycles
+  const { jobId, setJobId, isPolling } = useJobPolling(
+    sessionStorage.getItem('evaluationJobId'),
+    getEvaluationJobStatus,
+    {
+      storageKey: 'evaluationJobId',
+      onSuccess: (jobData) => {
+        if (jobData.result) {
+          setEvaluationResult(formatEvaluationResult(jobData.result));
+        } else {
+          setError(formatError(new Error("Job completed but returned empty results."), "Job finished but no result was found."));
+        }
+      },
+      onError: (errorMessage) => {
+        setError(errorMessage);
+      },
+      formatError: formatError,
+    }
+  );
+
+  // isLoading should be true if we are polling but don't have a result or an error yet.
+  const isLoading = isPolling && !evaluationResult && !error;
+
+  // Effect for cycling loading text
   useEffect(() => {
-    let intervalId;
+    let loadingTextIntervalId;
+
     if (isLoading) {
       let statusIndex = 0;
-      intervalId = setInterval(() => {
+      setLoadingText(LOADING_STATUSES[statusIndex]);
+      loadingTextIntervalId = setInterval(() => {
         statusIndex = (statusIndex + 1) % LOADING_STATUSES.length;
         setLoadingText(LOADING_STATUSES[statusIndex]);
-      }, 700);
+      }, 1200);
     }
-    return () => clearInterval(intervalId);
+
+    return () => {
+      if (loadingTextIntervalId) {
+        clearInterval(loadingTextIntervalId);
+      }
+    };
   }, [isLoading]);
 
   // Helper to map and format evaluation fields from backend variations
@@ -100,7 +129,6 @@ export default function AIEvaluator() {
     e.preventDefault();
     if (!problemSlug.trim()) return;
 
-    setIsLoading(true);
     setEvaluationResult(null);
     setError("");
     setLoadingText("Initializing evaluation job...");
@@ -109,54 +137,18 @@ export default function AIEvaluator() {
       // 1. Trigger the background evaluation job
       const normalizedSlug = problemSlug.trim().toLowerCase();
       const response = await evaluateProblem(platform.toLowerCase(), normalizedSlug);
-      const jobId = response.data.job_id;
+      const newJobId = response.data.job_id;
+      setJobId(newJobId);
 
-      if (!jobId) {
+      if (!newJobId) {
         throw new Error("Backend did not return a valid job ID.");
       }
 
-      // 2. Poll status endpoint with exponential backoff up to 10 times
-      let isComplete = false;
-      let attempts = 0;
-      const maxAttempts = 10;
-      const baseDelay = 2000; // start with 2 seconds
-      const maxDelay = 30000; // cap backoff at 30 seconds
-
-      while (!isComplete && attempts < maxAttempts) {
-        attempts++;
-        const currentDelay = Math.min(baseDelay * Math.pow(2, attempts - 1), maxDelay);
-        setLoadingText(`Analyzing state spaces... (Re-checking in ${currentDelay / 1000}s)`);
-
-        await new Promise((resolve) => setTimeout(resolve, currentDelay));
-
-        try {
-          const statusResponse = await getEvaluationJobStatus(jobId);
-          const jobData = statusResponse.data;
-
-          if (jobData.status === "completed") {
-            if (jobData.result) {
-              setEvaluationResult(formatEvaluationResult(jobData.result));
-            } else {
-              throw new Error("Job completed but returned empty results.");
-            }
-            isComplete = true;
-          } else if (jobData.status === "failed") {
-            throw new Error(jobData.error_message || "Evaluation job failed on the server.");
-          }
-        } catch (fetchError) {
-          console.warn("Polling status check encountered an issue:", fetchError);
-          throw fetchError;
-        }
-      }
-
-      if (!isComplete) {
-        throw new Error("Polling timed out. Deep AI evaluation task took too long.");
-      }
+      // The useEffect hook for polling will now automatically start.
     } catch (err) {
       console.error("Evaluation error:", err);
       setError(formatError(err, "Failed to complete algorithmic evaluation."));
-    } finally {
-      setIsLoading(false);
+      sessionStorage.removeItem('evaluationJobId'); // Clear on initial failure
     }
   };
 
